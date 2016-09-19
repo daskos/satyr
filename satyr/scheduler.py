@@ -1,72 +1,50 @@
 from __future__ import absolute_import, division, print_function
 
-import atexit
 import logging
 import os
-import signal
 import time
 from collections import Counter
+from functools import partial
 
-from mesos.interface import mesos_pb2
 from mesos.native import MesosSchedulerDriver
 
-from .binpack import bfd
+from .constraint import pour
 from .interface import Scheduler
-from .proxies import SchedulerProxy
+from .placement import bfd
+from .proxies import SchedulerDriverProxy, SchedulerProxy
 from .proxies.messages import FrameworkInfo, TaskInfo, encode
-from .utils import timeout
+from .utils import Interruptable, timeout
 
 
-class Running(object):
+class SchedulerDriver(SchedulerDriverProxy, Interruptable):
 
     def __init__(self, scheduler, name, user='', master=os.getenv('MESOS_MASTER'),
                  implicit_acknowledge=1, *args, **kwargs):
         framework = FrameworkInfo(name=name, user=user, *args, **kwargs)
-        scheduler = SchedulerProxy(scheduler)
-        self.driver = MesosSchedulerDriver(scheduler, encode(framework),
-                                           master, implicit_acknowledge)
-
-        def shutdown(signal, frame):
-            self.stop()
-
-        signal.signal(signal.SIGINT, shutdown)
-        signal.signal(signal.SIGTERM, shutdown)
-        atexit.register(self.stop)
-
-    def run(self):
-        return self.driver.run()
-
-    def start(self):
-        status = self.driver.start()
-        assert status == mesos_pb2.DRIVER_RUNNING
-        return status
-
-    def stop(self):
-        return self.driver.stop()
-
-    def join(self):
-        return self.driver.join()
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.stop()
-        self.join()
-        if exc_type:
-            raise exc_type, exc_value, traceback
+        driver = MesosSchedulerDriver(SchedulerProxy(scheduler),
+                                      encode(framework),
+                                      master, implicit_acknowledge)
+        super(SchedulerDriver, self).__init__(driver)
 
 
-class QueueScheduler(Scheduler):
+# TODO reuse the same type of executors
+class Framework(Scheduler):
 
-    def __init__(self, *args, **kwargs):
-        self.tasks = {}  # holding task_id => task pairs
+    def __init__(self, constraint=pour, placement=partial(bfd, cpus=1, mem=1)):
         self.healthy = True
+        self.tasks = {}      # holds task_id => task pairs
+        self.placement = placement
+        self.constraint = constraint
 
     @property
     def statuses(self):
         return {task_id: task.status for task_id, task in self.tasks.items()}
+
+    # @property
+    # def executors(self):
+    #     tpls = (((task.slave_id, task.executor.id), task)
+    #             for task_id, task in self.tasks.items())
+    #     return {k: list(v) for k, v in groupby(tpls)}
 
     def is_idle(self):
         return not len(self.tasks)
@@ -94,18 +72,28 @@ class QueueScheduler(Scheduler):
         logging.info('Received offers: {}'.format(sum(offers)))
         self.report()
 
-        # maybe limit to the first n tasks
+        # query tasks ready for scheduling
         staging = [self.tasks[status.task_id]
                    for status in self.statuses.values() if status.is_staging()]
-        # best-fit-decreasing binpacking
-        bins, skip = bfd(staging, offers, cpus=1, mem=1)
 
+        # filter acceptable offers
+        accepts, declines = self.constraint(offers)
+
+        # best-fit-decreasing binpacking
+        bins, skip = self.placement(staging, accepts)
+
+        # reject offers not met constraints
+        for offer in declines:
+            driver.decline(offer.id)
+
+        # launch tasks
         for offer, tasks in bins:
             try:
                 for task in tasks:
                     task.slave_id = offer.slave_id
                     task.status.state = 'TASK_STARTING'
                 # running with empty task list will decline the offer
+                logging.info('launches {}'.format(tasks))
                 driver.launch(offer.id, tasks)
             except Exception:
                 logging.exception('Exception occured during task launch!')
@@ -127,7 +115,11 @@ class QueueScheduler(Scheduler):
         self.report()
 
 
+# backward compatibility
+QueueScheduler = Framework
+
+
 if __name__ == '__main__':
     scheduler = QueueScheduler()
-    with Running(scheduler, name='test') as fw:
+    with SchedulerDriver(scheduler, name='test') as fw:
         scheduler.wait()

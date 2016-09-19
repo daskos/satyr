@@ -1,5 +1,5 @@
-FROM lensa/mesos-python:0.27.0-py2.7-python-2.7
+FROM kszucs/miniconda-mesos
 
-ADD . /satyr
-WORKDIR /satyr
-RUN pip install .
+ADD . /opt/satyr
+RUN pip --no-cache-dir install /opt/satyr \
+
